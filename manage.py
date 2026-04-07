@@ -17,6 +17,7 @@ import time
 import imaplib
 import email as email_lib
 from datetime import datetime
+from urllib.parse import urlparse, parse_qs
 
 CONFIG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.py")
 SCRIPT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "l2reborn_autoclaim.py")
@@ -106,32 +107,41 @@ def pick(prompt: str, options: list) -> str:
 
 def solve_turnstile_sync(api_key, site_key, page_url):
     import requests
-    print("    Solving Turnstile via 2captcha...")
-    r = requests.post("https://2captcha.com/in.php", data={
-        "key": api_key, "method": "turnstile",
-        "sitekey": site_key, "pageurl": page_url, "json": 1,
+    print("    Solving Turnstile via 2captcha (v2 API)...")
+    r = requests.post("https://api.2captcha.com/createTask", json={
+        "clientKey": api_key,
+        "task": {
+            "type": "TurnstileTaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        },
     }, timeout=30)
     data = r.json()
-    if data.get("status") != 1:
-        raise RuntimeError(f"2captcha error: {data}")
-    task_id = data["request"]
-    for _ in range(60):
-        time.sleep(5)
-        r = requests.get("https://2captcha.com/res.php", params={
-            "key": api_key, "action": "get", "id": task_id, "json": 1,
+    if data.get("errorId") != 0:
+        raise RuntimeError(f"2captcha submission error: {data}")
+    task_id = data["taskId"]
+    for _ in range(100):
+        time.sleep(3)
+        r = requests.post("https://api.2captcha.com/getTaskResult", json={
+            "clientKey": api_key,
+            "taskId": task_id,
         }, timeout=15)
         data = r.json()
-        if data.get("status") == 1:
-            return data["request"]
+        if data.get("status") == "ready":
+            print("    Turnstile solved ✓")
+            return data["solution"]["token"]
+        if data.get("errorId") != 0:
+            raise RuntimeError(f"2captcha poll error: {data}")
     raise RuntimeError("Turnstile timed out")
 
 
 def fetch_verification_link_sync(gmail_user, app_pw):
+    """Search Gmail for a wfls-email-verification link from l2reborn."""
     try:
         m = imaplib.IMAP4_SSL("imap.gmail.com")
         m.login(gmail_user, app_pw)
         m.select("inbox")
-        _, ids = m.search(None, '(UNSEEN FROM "l2reborn")')
+        _, ids = m.search(None, 'FROM "l2reborn"')
         for mid in (ids[0].split() or [])[-5:]:
             _, raw = m.fetch(mid, "(RFC822)")
             msg = email_lib.message_from_bytes(raw[0][1])
@@ -143,8 +153,7 @@ def fetch_verification_link_sync(gmail_user, app_pw):
             else:
                 body = msg.get_payload(decode=True).decode(errors="ignore")
             for link in re.findall(r'https?://[^\s"<>\']+', body):
-                if any(kw in link.lower() for kw in ("verify", "confirm", "token", "activate")):
-                    m.store(mid, "+FLAGS", "\\Seen")
+                if "wfls-email-verification" in link:
                     m.logout()
                     return link
         m.logout()
@@ -156,132 +165,153 @@ def fetch_verification_link_sync(gmail_user, app_pw):
 # ─── Browser: login + discover ────────────────────────────────────────────────
 
 async def browser_login_and_discover(acct: dict, api_key: str) -> dict | None:
-    """Log in and return {server: {game_account: [characters]}} or None on failure."""
+    """
+    Login via WordPress AJAX API and discover servers/accounts/characters.
+    Returns {server_name: {game_account: [characters]}} or None on failure.
+    """
     from playwright.async_api import async_playwright
+
+    cfg_obj = load_config()
+    turnstile_key = cfg_obj["TURNSTILE_KEY"]
+
+    async def _login(page, wfls_token=""):
+        await page.goto("https://l2reborn.org/signin/", wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(2)
+        print("    Solving Turnstile...")
+        token = await asyncio.to_thread(
+            solve_turnstile_sync, api_key, turnstile_key, "https://l2reborn.org/signin/"
+        )
+        print("    Token received — submitting login via AJAX...")
+        return await page.evaluate("""
+            async ({ email, password, token, wflsToken }) => {
+                const nr = await fetch('/wp-admin/admin-ajax.php', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({ action: 'l2mgm_nonce', nonce_name: 'l2mgm_login' }).toString()
+                });
+                const nd = await nr.json();
+                if (!nd.success) return { success: false, error: 'nonce failed' };
+                const lr = await fetch('/wp-admin/admin-ajax.php', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+                    body: new URLSearchParams({
+                        action: 'l2mgm_login',
+                        email: email, password: password,
+                        remember: '1', 'wfls-remember-device': '1',
+                        'cf-turnstile-response': token,
+                        'wfls-email-verification': wflsToken,
+                        redirect_to: '/account', nonce: nd.data.nonce,
+                    }).toString()
+                });
+                const raw = await lr.text();
+                try { return JSON.parse(raw); } catch { return { success: false, raw }; }
+            }
+        """, {"email": acct["email"], "password": acct["password"], "token": token, "wflsToken": wfls_token})
 
     result = None
     async with async_playwright() as pw:
-        browser = await pw.chromium.launch(headless=False, args=["--no-sandbox"])
-        ctx = await browser.new_context()
+        browser = await pw.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-blink-features=AutomationControlled"],
+        )
+        ctx = await browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/122.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 720},
+        )
+        await ctx.add_init_script(
+            "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+        )
         page = await ctx.new_page()
 
         try:
-            # Login
-            await page.goto("https://l2reborn.org/signin/", wait_until="networkidle")
-            await page.fill('input[type="email"], input[name="email"]', acct["email"])
-            await page.fill('input[type="password"]', acct["password"])
+            login_result = await _login(page)
+            print(f"    [DEBUG] Login result: {login_result}")
 
-            try:
-                site_key = await page.get_attribute('[data-sitekey]', 'data-sitekey', timeout=3000)
-                if site_key:
-                    token = await asyncio.to_thread(solve_turnstile_sync, api_key, site_key, page.url)
-                    await page.evaluate(
-                        f"document.querySelector('[name=\"cf-turnstile-response\"]').value = '{token}'"
-                    )
-            except Exception:
-                pass
-
-            await page.locator('input[type="submit"], button[type="submit"]').first.click()
-            await page.wait_for_load_state("networkidle")
-
-            # Handle email verification
-            await asyncio.sleep(3)
-            if any(kw in page.url for kw in ("verify", "confirm", "check", "email")):
-                print("    Email verification required — checking inbox...")
+            # Handle email verification if required
+            error = str(login_result.get("error", "")).lower()
+            if not login_result.get("success") and "verif" in error:
+                print("    Email verification required — checking Gmail inbox...")
                 for attempt in range(12):
-                    link = await asyncio.to_thread(fetch_verification_link_sync, acct["email"], acct["gmail_app_pw"])
+                    link = await asyncio.to_thread(
+                        fetch_verification_link_sync, acct["email"], acct["gmail_app_pw"]
+                    )
                     if link:
-                        await page.goto(link, wait_until="networkidle")
+                        print("    Found verification link — visiting it...")
+                        vp = await ctx.new_page()
+                        await vp.goto(link, wait_until="domcontentloaded", timeout=60000)
                         await asyncio.sleep(2)
-                        if "signin" in page.url:
-                            await page.fill('input[type="email"], input[name="email"]', acct["email"])
-                            await page.fill('input[type="password"]', acct["password"])
-                            await page.locator('input[type="submit"], button[type="submit"]').first.click()
-                            await page.wait_for_load_state("networkidle")
+                        await vp.close()
+                        params = parse_qs(urlparse(link).query)
+                        wfls_token = params.get("wfls-email-verification", [""])[0]
+                        login_result = await _login(page, wfls_token)
+                        print(f"    [DEBUG] Second login result: {login_result}")
                         break
                     print(f"    No email yet ({attempt+1}/12) — waiting 15s...")
                     await asyncio.sleep(15)
 
-            # Verify logged in
-            content = await page.content()
-            if acct["email"].split("@")[0] not in content and acct["email"] not in content:
-                print("    Login failed.")
+            if not login_result.get("success"):
+                print(f"    Login failed: {login_result}")
                 return None
 
-            print("    Logged in ✓  Discovering servers & accounts...")
+            print("    Logged in ✓  Discovering servers & characters via API...")
 
-            # Navigate to shop and discover options
-            await page.goto("https://l2reborn.org/shop/", wait_until="networkidle")
+            await page.goto("https://l2reborn.org/shop/", wait_until="domcontentloaded", timeout=60000)
             await asyncio.sleep(2)
 
-            # Get server tabs
-            server_names = await page.evaluate("""
-                () => {
-                    const tabs = document.querySelectorAll('.servers_tabs_item, [class*="tabs"] [class*="item"]');
-                    return Array.from(tabs).map(el => el.textContent.trim()).filter(t => t && t.length < 30);
+            # Fetch servers via AJAX
+            servers = await page.evaluate("""
+                async () => {
+                    try {
+                        const r = await fetch('/wp-admin/admin-ajax.php?action=l2mgm_get_servers');
+                        const d = await r.json();
+                        if (d.success && Array.isArray(d.data) && d.data.length)
+                            return d.data.map(s => ({ id: String(s.id ?? s.server_id ?? ''), name: s.name || s.server_name || ('Server ' + (s.id ?? '')) }));
+                    } catch(e) {}
+                    return [];
                 }
             """)
-            known = ["Origins", "Signature", "Essence", "Eternal IL", "Forever H5"]
-            servers_found = list(dict.fromkeys([s for s in (server_names or known) if s in known or s]))
+
+            # Fetch characters via AJAX
+            characters = await page.evaluate("""
+                async () => {
+                    for (const action of ['l2mgm_get_characters', 'l2mgm_get_account_characters']) {
+                        try {
+                            const r = await fetch('/wp-admin/admin-ajax.php?action=' + action);
+                            const d = await r.json();
+                            if (d.success && Array.isArray(d.data) && d.data.length)
+                                return d.data.map(c => ({
+                                    id: String(c.id || c.char_id || ''),
+                                    name: c.name || c.char_name || c.nickname || '',
+                                    account: c.account || c.login || '',
+                                    serverId: String(c.server_id || c.serverId || ''),
+                                }));
+                        } catch(e) {}
+                    }
+                    return [];
+                }
+            """)
+            print(f"    Servers: {[s['name'] for s in servers]}  Characters: {len(characters)}")
+
+            if not servers and not characters:
+                return None
+
+            if not servers:
+                servers = [{"id": "", "name": "Default"}]
 
             result = {}
-            for server in servers_found:
-                try:
-                    await page.locator(f'text="{server}"').first.click()
-                    await asyncio.sleep(1)
-                except Exception:
-                    continue
-
-                # Click Receive to open modal
-                clicked = await page.evaluate("""
-                    () => {
-                        const els = Array.from(document.querySelectorAll('.btn_recive_shop.js-open-shop-service'));
-                        const v = els.find(el => el.getBoundingClientRect().width > 0);
-                        if (v) { v.click(); return true; }
-                        return false;
-                    }
-                """)
-                if not clicked:
-                    continue
-                await asyncio.sleep(1.5)
-
-                # Scrape game accounts
-                try:
-                    await page.locator('text="Select account"').first.click()
-                    await asyncio.sleep(0.5)
-                except Exception:
-                    pass
-
-                game_accounts = await page.evaluate("""
-                    () => Array.from(document.querySelectorAll('.select_body_item'))
-                          .map(el => el.textContent.trim()).filter(Boolean)
-                """)
-
-                result[server] = {}
-                for ga in game_accounts:
-                    try:
-                        await page.locator(f'text="{ga}"').first.click()
-                        await asyncio.sleep(0.4)
-                        await page.locator('text="Select character"').first.click()
-                        await asyncio.sleep(0.4)
-                        chars = await page.evaluate("""
-                            () => Array.from(document.querySelectorAll('.select_body_item'))
-                                  .map(el => el.textContent.trim()).filter(Boolean)
-                        """)
-                        result[server][ga] = chars
-                        try:
-                            await page.locator('text="Select account"').first.click()
-                            await asyncio.sleep(0.3)
-                        except Exception:
-                            pass
-                    except Exception:
-                        result[server][ga] = []
-
-                try:
-                    await page.locator('text="Close"').first.click()
-                except Exception:
-                    await page.keyboard.press("Escape")
-                await asyncio.sleep(0.5)
+            for srv in servers:
+                chars_for_server = [c for c in characters if not c["serverId"] or c["serverId"] == srv["id"]]
+                by_account: dict = {}
+                for c in chars_for_server:
+                    name = c["account"] or "Default"
+                    by_account.setdefault(name, [])
+                    if c["name"] and c["name"] not in by_account[name]:
+                        by_account[name].append(c["name"])
+                result[srv["name"]] = by_account
 
         except Exception as e:
             print(f"    Discovery error: {e}")
