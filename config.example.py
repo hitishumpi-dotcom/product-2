@@ -9,6 +9,11 @@ TWOCAPTCHA_KEY = "YOUR_2CAPTCHA_API_KEY_HERE"
 # Cloudflare Turnstile site key for l2reborn.org (don't change this)
 TURNSTILE_KEY  = "0x4AAAAAAAPFfPxwacy3GCxf"
 
+# Optional: get run reports pushed to a Telegram chat after each cycle.
+# Leave both blank to disable — nothing is sent anywhere by default.
+TELEGRAM_BOT_TOKEN = ""
+TELEGRAM_CHAT_ID   = ""
+
 # Add one entry per account.
 # Tip: use the "+ Add" button in the GUI — it fills server_id and character_id automatically.
 ACCOUNTS = [

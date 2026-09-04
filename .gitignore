@@ -1,0 +1,7 @@
+config.py
+status.json
+*.log
+__pycache__/
+*.pyc
+debug_*.html
+.claude/

@@ -6,6 +6,7 @@ Run by Windows Task Scheduler every 12 hours.
 """
 
 import asyncio
+import html
 import imaplib
 import email as email_lib
 import re
@@ -14,6 +15,7 @@ import json
 import logging
 import os
 import sys
+import requests
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
@@ -21,6 +23,27 @@ try:
     from config import ACCOUNTS, TWOCAPTCHA_KEY, TURNSTILE_KEY
 except ImportError:
     raise SystemExit("ERROR: config.py not found.")
+
+# ─── TELEGRAM (optional) ────────────────────────────────────────────────────
+# Set TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID in config.py to get run reports
+# pushed to a Telegram chat. Leave them blank in config.py to disable.
+try:
+    from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+except ImportError:
+    TELEGRAM_BOT_TOKEN = ""
+    TELEGRAM_CHAT_ID = ""
+
+def telegram_notify(message: str):
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+            json={"chat_id": TELEGRAM_CHAT_ID, "text": message, "parse_mode": "HTML"},
+            timeout=10,
+        )
+    except Exception as e:
+        log.warning(f"Telegram notify failed: {e}")
 
 BASE_DIR    = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE    = os.path.join(BASE_DIR, "l2reborn_autoclaim.log")
@@ -57,54 +80,89 @@ def save_status(data):
 # ─── 2CAPTCHA ─────────────────────────────────────────────────────────────────
 
 def solve_turnstile(api_key, site_key, page_url):
-    import requests
     log.info("Submitting Turnstile to 2captcha...")
-    r = requests.post("https://2captcha.com/in.php", data={
-        "key": api_key, "method": "turnstile",
-        "sitekey": site_key, "pageurl": page_url, "json": 1,
+    r = requests.post("https://api.2captcha.com/createTask", json={
+        "clientKey": api_key,
+        "task": {
+            "type": "TurnstileTaskProxyless",
+            "websiteURL": page_url,
+            "websiteKey": site_key,
+        },
     }, timeout=30)
     data = r.json()
-    if data.get("status") != 1:
-        raise RuntimeError(f"2captcha submit error: {data}")
-    task_id = data["request"]
+    if data.get("errorId") != 0:
+        raise RuntimeError(f"2captcha submission error: {data}")
+    task_id = data["taskId"]
     log.info(f"Task {task_id} — polling...")
-    for _ in range(60):
-        time.sleep(5)
-        r = requests.get("https://2captcha.com/res.php", params={
-            "key": api_key, "action": "get", "id": task_id, "json": 1,
+    for _ in range(100):
+        time.sleep(3)
+        r = requests.post("https://api.2captcha.com/getTaskResult", json={
+            "clientKey": api_key,
+            "taskId": task_id,
         }, timeout=15)
         data = r.json()
-        if data.get("status") == 1:
+        if data.get("status") == "ready":
             log.info("Turnstile solved")
-            return data["request"]
-        if data.get("request") not in ("CAPCHA_NOT_READY", "ERROR_CAPTCHA_UNSOLVABLE"):
-            raise RuntimeError(f"2captcha error: {data}")
-    raise RuntimeError("Turnstile solve timed out")
+            return data["solution"]["token"]
+        if data.get("errorId") != 0:
+            raise RuntimeError(f"2captcha poll error: {data}")
+    raise RuntimeError("Turnstile timed out — check your 2captcha balance")
 
 
 # ─── GMAIL ────────────────────────────────────────────────────────────────────
 
-def fetch_verification_link(gmail_user, app_pw):
+def _imap_connect(gmail_user, app_pw):
+    m = imaplib.IMAP4_SSL("imap.gmail.com")
+    m.login(gmail_user, app_pw)
+    m.select("inbox")
+    return m
+
+def _extract_wfls_link(raw_bytes):
+    msg = email_lib.message_from_bytes(raw_bytes)
+    body = ""
+    if msg.is_multipart():
+        for part in msg.walk():
+            if part.get_content_type() in ("text/html", "text/plain"):
+                body += part.get_payload(decode=True).decode(errors="ignore")
+    else:
+        body = msg.get_payload(decode=True).decode(errors="ignore")
+    for link in re.findall(r'https?://[^\s"<>\']+', body):
+        if "wfls-email-verification" in link:
+            return html.unescape(link)
+    return None
+
+def fetch_verification_link(gmail_user, app_pw, since: datetime):
+    """Find the most recent wfls verification link from emails received after `since`."""
     try:
-        m = imaplib.IMAP4_SSL("imap.gmail.com")
-        m.login(gmail_user, app_pw)
-        m.select("inbox")
-        _, ids = m.search(None, '(UNSEEN FROM "l2reborn")')
-        for mid in (ids[0].split() or [])[-5:]:
+        m = _imap_connect(gmail_user, app_pw)
+        # Search by date only — ignore read/unread so phone reads don't break it
+        since_str = since.strftime("%d-%b-%Y")
+        _, ids = m.search(None, f'FROM "info@l2reborn.org" SINCE "{since_str}"')
+        all_ids = ids[0].split()
+        log.info(f"  Gmail: {len(all_ids)} email(s) from info@l2reborn.org since {since_str}")
+        # Check newest first, pick the one received after our `since` timestamp
+        for mid in reversed(all_ids):
             _, raw = m.fetch(mid, "(RFC822)")
             msg = email_lib.message_from_bytes(raw[0][1])
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() in ("text/html", "text/plain"):
-                        body += part.get_payload(decode=True).decode(errors="ignore")
-            else:
-                body = msg.get_payload(decode=True).decode(errors="ignore")
-            for link in re.findall(r'https?://[^\s"<>\']+', body):
-                if "wfls-email-verification" in link:
-                    m.store(mid, "+FLAGS", "\\Seen")
-                    m.logout()
-                    return link
+            date_str = msg.get("Date", "")
+            try:
+                import email.utils
+                received_tuple = email.utils.parsedate_tz(date_str)
+                if received_tuple:
+                    # Convert both to UTC unix timestamps for accurate comparison
+                    received_unix = email.utils.mktime_tz(received_tuple)
+                    since_unix = since.timestamp()
+                    log.info(f"    Email date: {date_str} | received_unix={received_unix:.0f} since_unix={since_unix:.0f} diff={received_unix - since_unix:.0f}s")
+                    if received_unix < (since_unix - 30):  # 30s buffer only — must be fresh
+                        continue
+                else:
+                    log.info(f"    Could not parse date: {date_str} — including email")
+            except Exception as ex:
+                log.info(f"    Date parse error: {ex} — including email")
+            link = _extract_wfls_link(raw[0][1])
+            if link:
+                m.logout()
+                return link
         m.logout()
     except Exception as e:
         log.error(f"Gmail check failed: {e}")
@@ -147,6 +205,9 @@ async def ajax_login(page, acct, wfls_token=""):
 async def claim_for_account(page, acct):
     label = acct["label"]
 
+    # Record time before login so we only pick up verification emails sent after this point
+    login_time = datetime.now()
+
     # Login
     await page.goto("https://l2reborn.org/signin/", wait_until="domcontentloaded", timeout=60000)
     await asyncio.sleep(2)
@@ -160,23 +221,54 @@ async def claim_for_account(page, acct):
         await asyncio.sleep(3)
         result = await ajax_login(page, acct)
 
-    # Email verification
+    # Email verification — the link from the email IS the login token; navigate to it directly
     if not result.get("success") and "verif" in str(result.get("error", "")).lower():
-        log.info(f"[{label}] Email verification required — checking Gmail...")
-        for attempt in range(12):
-            link = await asyncio.to_thread(fetch_verification_link, acct["email"], acct["gmail_app_pw"])
+        log.info(f"[{label}] Email verification required — waiting for email from info@l2reborn.org...")
+        link = None
+        for attempt in range(24):  # up to 6 minutes
+            link = await asyncio.to_thread(fetch_verification_link, acct["email"], acct["gmail_app_pw"], login_time)
             if link:
-                vp = await page.context.new_page()
-                await vp.goto(link, wait_until="domcontentloaded", timeout=60000)
-                await asyncio.sleep(2)
-                await vp.close()
-                wfls_token = parse_qs(urlparse(link).query).get("wfls-email-verification", [""])[0]
-                result = await ajax_login(page, acct, wfls_token)
                 break
-            log.info(f"[{label}]   No email yet ({attempt+1}/12) — waiting 15s...")
+            log.info(f"[{label}]   No email yet ({attempt+1}/24) — waiting 15s...")
             await asyncio.sleep(15)
 
-    if not result.get("success"):
+        if not link:
+            log.error(f"[{label}] Verification email never arrived after 6 minutes")
+            now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            status = load_status()
+            entry = status.get(acct["email"], {})
+            entry["last_run_at"] = now_str
+            entry["last_run_result"] = "needs_verification"
+            status[acct["email"]] = entry
+            save_status(status)
+            return "needs_verification"
+
+        # Navigate to the verification link on the SAME page.
+        # The wfls plugin sets a session cookie server-side when the link is visited.
+        # Then do AJAX login from that same page — the session already has the trusted device.
+        # Do NOT pass the token in the AJAX body — the server reads it from the session.
+        log.info(f"[{label}] Navigating to verification link on same page...")
+        await page.goto(link, wait_until="domcontentloaded", timeout=60000)
+        await asyncio.sleep(3)
+        log.info(f"[{label}] Landed on: {page.url} — logging in...")
+        result = await ajax_login(page, acct, "")
+        log.info(f"[{label}] Post-verification login: success={result.get('success')} error={result.get('error','none')}")
+        # Retry once if captcha was rejected (token can expire during page navigation)
+        if not result.get("success") and "captcha" in str(result.get("error", "")).lower():
+            log.warning(f"[{label}] Captcha rejected after verification — retrying once...")
+            await asyncio.sleep(3)
+            result = await ajax_login(page, acct, "")
+            log.info(f"[{label}] Retry login: success={result.get('success')} error={result.get('error','none')}")
+        if not result.get("success"):
+            log.error(f"[{label}] Login failed after verification: {result}")
+            return "needs_verification"
+        log.info(f"[{label}] Logged in successfully after verification")
+
+    elif not result.get("success"):
+        error_msg = str(result.get("error", ""))
+        if "blocked" in error_msg.lower() or "too many" in error_msg.lower():
+            log.error(f"[{label}] Account blocked by rate limit — aborting retries: {result}")
+            return "blocked"
         log.error(f"[{label}] Login failed: {result}")
         return False
 
@@ -304,31 +396,100 @@ async def run():
         active = [a for a in ACCOUNTS if a.get("enabled", True)]
         log.info(f"Active accounts: {len(active)}/{len(ACCOUNTS)}")
 
+        MAX_RETRIES = 3
+        results = {}  # label -> (ok, email)
         for idx, acct in enumerate(active):
             log.info(f"\n── {acct['label']} ({idx+1}/{len(active)}) ──")
-            ctx = await browser.new_context(
-                user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-                ),
-                viewport={"width": 1280, "height": 720},
-            )
-            await ctx.add_init_script(
-                "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
-            )
-            page = await ctx.new_page()
-            try:
-                await claim_for_account(page, acct)
-            except Exception as e:
-                log.error(f"[{acct['label']}] Unexpected error: {e}", exc_info=True)
-            finally:
-                await ctx.close()
+            attempt = 0
+            ok = None
+            while ok is not True and attempt < MAX_RETRIES:
+                attempt += 1
+                delay = min(10 * (2 ** (attempt - 1)), 300)
+                log.info(f"[{acct['label']}] Attempt {attempt}/{MAX_RETRIES}...")
+                ctx = await browser.new_context(
+                    user_agent=(
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                    ),
+                    viewport={"width": 1280, "height": 720},
+                )
+                await ctx.add_init_script(
+                    "Object.defineProperty(navigator,'webdriver',{get:()=>undefined})"
+                )
+                page = await ctx.new_page()
+                try:
+                    ok = await asyncio.wait_for(claim_for_account(page, acct), timeout=600)
+                except asyncio.TimeoutError:
+                    log.error(f"[{acct['label']}] Attempt {attempt} timed out (5 min)")
+                    ok = None
+                except Exception as e:
+                    log.error(f"[{acct['label']}] Attempt {attempt} error: {e}")
+                    ok = None
+                finally:
+                    await ctx.close()
+                if ok in ("blocked", "needs_verification"):
+                    reason = "blocked by rate limit" if ok == "blocked" else "verification token rejected — will retry next cycle"
+                    log.error(f"[{acct['label']}] {reason} — skipping to next account")
+                    ok = False
+                    break
+                if ok is not True:
+                    log.warning(f"[{acct['label']}] Attempt {attempt} failed — retrying in {delay}s...")
+                    await asyncio.sleep(delay)
+            if ok is not True and attempt >= MAX_RETRIES:
+                log.error(f"[{acct['label']}] Exhausted {MAX_RETRIES} retries — giving up")
+                ok = False
+            results[acct["label"]] = (ok, acct["email"])
             if idx < len(active) - 1:
                 await asyncio.sleep(5)
 
         await browser.close()
 
     log.info("\nAll accounts processed.")
+
+    # ── Telegram report (optional — no-op if not configured) ─────────────────
+    from datetime import timedelta
+    status = load_status()
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+    lines = [f"<b>🎮 L2Reborn VIP Ticket Report</b>", f"<i>{now_str}</i>", ""]
+    for label, (ok, email) in results.items():
+        entry = status.get(email, {})
+        run_result = entry.get("last_run_result", "")
+        last_claimed = entry.get("last_claimed")
+        if last_claimed:
+            next_claim = datetime.strptime(last_claimed, "%Y-%m-%d %H:%M:%S") + timedelta(hours=12)
+            next_str = next_claim.strftime("%Y-%m-%d %H:%M")
+        else:
+            next_str = "unknown"
+
+        if not ok and run_result == "needs_verification":
+            lines.append(f"🔐 {label} — verification email not found in time, will retry next cycle")
+        elif not ok:
+            lines.append(f"❌ {label} — failed\n   ⚠️ Check log for details")
+        elif run_result == "cooldown":
+            lines.append(f"🔁 {label} — cooldown\n   ⏰ Next claim: {next_str}")
+        else:
+            lines.append(f"✅ {label} — claimed\n   ⏰ Next claim: {next_str}")
+    telegram_notify("\n".join(lines))
+
+    # ── Reschedule task 12h15m from now ─────────────────────────────────────
+    import subprocess
+    from datetime import timedelta
+    next_run = datetime.now() + timedelta(hours=12, minutes=15)
+    next_run_str = next_run.strftime("%H:%M")
+    next_run_date = next_run.strftime("%d/%m/%Y")
+    ps_cmd = (
+        f"$t = Get-ScheduledTask -TaskName 'L2Reborn AutoVote';"
+        f"$t.Triggers[0].StartBoundary = '{next_run.strftime('%Y-%m-%dT%H:%M:%S')}';"
+        f"Set-ScheduledTask -TaskName 'L2Reborn AutoVote' -Trigger $t.Triggers[0]"
+    )
+    result = subprocess.run(
+        ["powershell", "-NonInteractive", "-Command", ps_cmd],
+        capture_output=True, text=True
+    )
+    if result.returncode == 0:
+        log.info(f"Next run scheduled for {next_run.strftime('%Y-%m-%d %H:%M')}")
+    else:
+        log.error(f"Failed to reschedule task: {result.stderr.strip() or result.stdout.strip()}")
 
 
 if __name__ == "__main__":

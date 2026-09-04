@@ -1616,15 +1616,17 @@ class App(tk.Tk):
                 self.log(f"Could not remove schedule: {e}", "error")
         else:
             try:
+                import sys
+                python_exe = sys.executable
                 now = datetime.now().strftime("%H:%M")
                 subprocess.run([
                     "schtasks", "/create",
                     "/tn", "L2Reborn AutoVote",
-                    "/tr", f'python "{CLAIM_PATH}"',
-                    "/sc", "HOURLY", "/mo", "12",
+                    "/tr", f'"{python_exe}" "{CLAIM_PATH}"',
+                    "/sc", "MINUTE", "/mo", "735",
                     "/st", now, "/f",
                 ], check=True)
-                self.log("Auto-vote scheduled every 12 hours ✓", "success")
+                self.log("Auto-vote scheduled every 12h 15m ✓", "success")
             except Exception as e:
                 self.log(f"Schedule failed (try running as Administrator): {e}", "error")
         self._refresh_schedule_btn()

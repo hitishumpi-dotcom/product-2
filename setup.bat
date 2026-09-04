@@ -30,6 +30,13 @@ echo Installing Chromium browser...
 python -m playwright install chromium
 echo.
 
+:: Create config.py from the template on first run
+if not exist "%~dp0config.py" (
+    copy "%~dp0config.example.py" "%~dp0config.py" >nul
+    echo Created config.py from template.
+    echo.
+)
+
 echo ============================================
 echo  Setup complete!
 echo ============================================
@@ -46,4 +53,5 @@ echo      The app will auto-discover your server and character.
 echo.
 echo   4. Click "Run Now" to vote, or "Schedule 12h" to automate.
 echo.
+if /i "%~1"=="/nopause" exit /b 0
 pause

@@ -9,11 +9,11 @@ set SCRIPT_DIR=%~dp0
 set SCRIPT=%SCRIPT_DIR%l2reborn_autoclaim.py
 
 :: Delete existing task if present
-schtasks /delete /tn "L2Reborn AutoClaim" /f >nul 2>&1
+schtasks /delete /tn "L2Reborn AutoVote" /f >nul 2>&1
 
 :: Create task — runs every 12 hours starting now
 schtasks /create ^
-  /tn "L2Reborn AutoClaim" ^
+  /tn "L2Reborn AutoVote" ^
   /tr "python \"%SCRIPT%\"" ^
   /sc HOURLY ^
   /mo 12 ^
@@ -26,7 +26,7 @@ echo.
 if %errorlevel% equ 0 (
     echo Task created successfully!
     echo The script will run every 12 hours starting now.
-    echo You can view it in Task Scheduler under "L2Reborn AutoClaim".
+    echo You can view it in Task Scheduler under "L2Reborn AutoVote".
 ) else (
     echo Failed to create task. Try running this .bat as Administrator.
 )
